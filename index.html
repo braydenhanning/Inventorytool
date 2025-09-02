@@ -1,0 +1,348 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Simple Inventory Scanner</title>
+<style>
+  :root { --pad:14px; --radius:10px; --border:#e6e6e6; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin:0; padding:var(--pad); color:#111; }
+  h1 { font-size: 18px; margin: 0 0 10px; font-weight: 700; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  button { padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:#fff; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .pill { padding:8px 10px; border:1px solid var(--border); border-radius: 999px; background:#fff; font-size: 13px; }
+  #videoWrap { position:relative; border:1px solid var(--border); border-radius: var(--radius); overflow:hidden; }
+  video { width:100%; height:auto; display:block; background:#000; }
+  .guide { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+           width:70%; height:22%; border:2px solid rgba(255,255,255,.9); border-radius:8px; pointer-events:none; transition: border-color .15s ease; }
+  .guide.lock { border-color: #28a745; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+  input[type="text"], input[type="number"] { padding:10px; border:1px solid var(--border); border-radius:8px; }
+  input[readonly] { background:#fafafa; }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  th, td { border-top:1px solid var(--border); padding:10px 6px; text-align:left; }
+  th { position:sticky; top:0; background:#fff; }
+  td:last-child, th:last-child { text-align:center; }
+  .right { margin-left:auto; }
+  .tiny { font-size:12px; color:#666; }
+  #errorMsg { display:none; color:#b00; font-weight:bold; }
+</style>
+</head>
+<body>
+
+<h1>Simple Inventory Scanner</h1>
+
+<div class="bar">
+  <button id="startBtn">Start Camera</button>
+  <button id="stopBtn" disabled>Stop</button>
+  <span id="statusPill" class="pill">Idle</span>
+  <span class="right tiny">
+    Per-scan increment
+    <input id="defaultQty" type="number" value="1" min="1" style="width:70px" />
+  </span>
+</div>
+
+<div id="videoWrap">
+  <video id="preview" playsinline muted></video>
+  <div class="guide" aria-hidden="true"></div>
+</div>
+
+<div class="row">
+  <input id="lastCode" class="pill" style="flex:1; min-width:220px" placeholder="Last scan will appear here" readonly />
+  <input id="manualCode" type="text" placeholder="Enter code manually" style="flex:1; min-width:180px" />
+  <button id="addManualBtn">Add</button>
+  <span id="totalsPill" class="pill">0 SKUs • 0 Qty</span>
+</div>
+<p id="errorMsg">❌ Wrong barcode — not in database</p>
+
+<div class="bar">
+  <button id="exportXlsx">Export .xlsx</button>
+  <button id="exportCsv">Export .csv</button>
+  <button id="undoBtn">Undo</button>
+  <button id="clearBtn">Clear</button>
+  <span class="tiny">Duplicates auto-merge & increment qty</span>
+</div>
+
+<table id="grid">
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Barcode / SKU</th>
+      <th>Qty</th>
+      <th>Notes</th>
+      <th>Timestamp</th>
+      <th>✕</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script type="module">
+import { BrowserMultiFormatReader, NotFoundException } from "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/+esm";
+
+const $ = s => document.querySelector(s);
+const video = $("#preview");
+const wrap = $("#videoWrap");
+const guide = $(".guide");
+const statusPill = $("#statusPill");
+const tbody = $("#grid tbody");
+const startBtn = $("#startBtn");
+const stopBtn = $("#stopBtn");
+const lastCode = $("#lastCode");
+const manualCode = $("#manualCode");
+const addManualBtn = $("#addManualBtn");
+const exportXlsx = $("#exportXlsx");
+const exportCsv = $("#exportCsv");
+const undoBtn = $("#undoBtn");
+const clearBtn = $("#clearBtn");
+const defaultQty = $("#defaultQty");
+const totalsPill = $("#totalsPill");
+const errorMsg = $("#errorMsg");
+
+let stream = null;
+let reader = null;
+let rows = [];
+let history = [];
+let lastHit = { code:"", at:0 };
+let scanning = false;
+
+// auto-detect helpers
+let rafId = null;
+let stableCode = null;
+let stableCount = 0;
+const STABLE_NEED = 2;        // require N consecutive frames seeing same code
+const LOCK_COOLDOWN = 800;    // ms after a scan to ignore further hits
+let lockUntil = 0;
+
+/* --- Database of valid codes --- */
+const validCodes = {
+  "0": "Test Barcode",
+  "12345": "Demo Item",
+  "99999": "Sample Product"
+};
+
+startBtn.onclick = startCamera;
+stopBtn.onclick = stopCamera;
+addManualBtn.onclick = () => {
+  const c = manualCode.value.trim();
+  if (c) { handleDecoded(c); manualCode.value=""; manualCode.focus(); }
+};
+manualCode.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); addManualBtn.click(); }
+});
+
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio:false
+    });
+    video.srcObject = stream;
+    await video.play();
+    scanning = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    statusPill.textContent = "Looking for barcode…";
+    runAutoDetectLoop();
+  } catch (e) {
+    alert("Camera error: " + e);
+  }
+}
+function stopCamera() {
+  scanning = false;
+  cancelAnimationFrame(rafId);
+  if (reader?.reset) { try { reader.reset(); } catch {} }
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  statusPill.textContent = "Idle";
+  guide.classList.remove("lock");
+}
+video.addEventListener("click", () => {/* iOS refocuses on tap */});
+
+function feedback() {
+  try { navigator.vibrate?.(60); } catch {}
+  const ctx = new (window.AudioContext||window.webkitAudioContext)();
+  const osc = ctx.createOscillator(), g = ctx.createGain();
+  osc.connect(g); g.connect(ctx.destination); osc.frequency.value = 880; osc.start();
+  setTimeout(()=>{osc.stop(); ctx.close();}, 110);
+}
+
+/* ---------- AUTO-DETECT LOOP (ROI) ---------- */
+const useNative = ('BarcodeDetector' in window);
+let detector = null;
+let roiCanvas = document.createElement('canvas');
+let roiCtx = roiCanvas.getContext('2d');
+
+async function runAutoDetectLoop() {
+  if (useNative && !detector) {
+    detector = new BarcodeDetector({
+      formats: ['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','qr_code','pdf417']
+    });
+  } else if (!useNative && !reader) {
+    reader = new BrowserMultiFormatReader();
+  }
+  // set up a rAF loop
+  const loop = async () => {
+    if (!scanning || !video.videoWidth) { rafId = requestAnimationFrame(loop); return; }
+
+    // compute ROI from guide element relative to video
+    const vRect = video.getBoundingClientRect();
+    const gRect = guide.getBoundingClientRect();
+    const sx = Math.max(0, gRect.left - vRect.left);
+    const sy = Math.max(0, gRect.top - vRect.top);
+    const sw = Math.min(vRect.width, gRect.width);
+    const sh = Math.min(vRect.height, gRect.height);
+
+    // scale ROI to the underlying video resolution
+    const scaleX = video.videoWidth / vRect.width;
+    const scaleY = video.videoHeight / vRect.height;
+    const sxV = Math.floor(sx * scaleX);
+    const syV = Math.floor(sy * scaleY);
+    const swV = Math.max(1, Math.floor(sw * scaleX));
+    const shV = Math.max(1, Math.floor(sh * scaleY));
+
+    roiCanvas.width = swV;
+    roiCanvas.height = shV;
+    roiCtx.drawImage(video, sxV, syV, swV, shV, 0, 0, swV, shV);
+
+    let decoded = null;
+
+    try {
+      if (useNative) {
+        const bitmap = await createImageBitmap(roiCanvas);
+        const results = await detector.detect(bitmap);
+        bitmap.close?.();
+        if (results && results.length) decoded = results[0].rawValue;
+      } else {
+        // ZXing fallback on full video (ROI decodeOnce support varies).
+        const res = await reader.decodeOnceFromVideoElement(video).catch(()=>null);
+        if (res?.text) decoded = res.text;
+      }
+    } catch { /* ignore per-frame errors */ }
+
+    const now = Date.now();
+    if (decoded && now >= lockUntil) {
+      statusPill.textContent = "Barcode detected…";
+      // Stabilize: require same code for a couple frames
+      if (decoded === stableCode) {
+        stableCount++;
+      } else {
+        stableCode = decoded;
+        stableCount = 1;
+      }
+      if (stableCount >= STABLE_NEED) {
+        guide.classList.add("lock");
+        lockUntil = now + LOCK_COOLDOWN;
+        stableCount = 0;
+        // Handle the decoded value
+        handleDecoded(decoded);
+        // brief visual lock release later
+        setTimeout(()=> guide.classList.remove("lock"), 300);
+      }
+    } else {
+      if (now < lockUntil) {
+        statusPill.textContent = "Scanned ✓";
+      } else {
+        statusPill.textContent = "Looking for barcode…";
+      }
+      stableCount = 0;
+      stableCode = null;
+    }
+
+    rafId = requestAnimationFrame(loop);
+  };
+  rafId = requestAnimationFrame(loop);
+}
+
+/* Handle a decoded raw code: validate + add/merge */
+function handleDecoded(codeRaw) {
+  const code = String(codeRaw||"").trim();
+  if (!code) return;
+
+  // show raw in lastCode first
+  lastCode.value = code;
+
+  if (!(code in validCodes)) {
+    errorMsg.style.display = "block";
+    statusPill.textContent = "Not in database";
+    setTimeout(()=> errorMsg.style.display="none", 1600);
+    return;
+  }
+
+  const display = validCodes[code];
+  errorMsg.style.display = "none";
+  statusPill.textContent = "Scanned ✓";
+  feedback();
+  addOrMerge(display, Number(defaultQty.value)||1);
+}
+
+/* ---------- Table + Totals ---------- */
+function addOrMerge(code, qty) {
+  let i = rows.findIndex(r => !r._deleted && r.code === code);
+  if (i >= 0) {
+    rows[i].qty += qty;
+    updateRow(i);
+    computeTotals();
+    return;
+  }
+  const item = { code, qty, notes:"", ts:new Date().toISOString() };
+  rows.push(item);
+  appendRow(item, rows.length-1);
+  computeTotals();
+}
+
+function appendRow(item, idx) {
+  const tr = document.createElement("tr");
+  tr.dataset.idx = idx;
+  tr.innerHTML = `
+    <td class="n"></td>
+    <td>${escape(item.code)}</td>
+    <td><input class="qty" type="number" min="0" value="${item.qty}" style="width:80px" /></td>
+    <td><input class="notes" type="text" placeholder="(optional)" value="${escape(item.notes)}" /></td>
+    <td>${new Date(item.ts).toLocaleString()}</td>
+    <td><button class="del">✕</button></td>
+  `;
+  tr.querySelector('.qty').oninput = e => { rows[idx].qty = Number(e.target.value)||0; computeTotals(); };
+  tr.querySelector('.notes').oninput = e => rows[idx].notes = e.target.value;
+  tr.querySelector('.del').onclick = () => removeRow(idx);
+  tbody.appendChild(tr);
+  renumber();
+}
+function updateRow(idx) {
+  let tr = [...tbody.querySelectorAll("tr")].find(r => Number(r.dataset.idx)===idx);
+  if (tr) tr.querySelector('.qty').value = rows[idx].qty;
+}
+function removeRow(idx) { rows[idx]._deleted=true; [...tbody.querySelectorAll("tr")].forEach(r=>{if(Number(r.dataset.idx)===idx)r.remove();}); computeTotals(); }
+function renumber(){ [...tbody.querySelectorAll("tr")].forEach((tr,i)=> tr.querySelector(".n").textContent = i+1); }
+const escape = s => String(s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
+
+/* Totals pill */
+function computeTotals() {
+  const active = rows.filter(r => !r._deleted);
+  totalsPill.textContent = `${active.length} SKUs • ${active.reduce((sum,r)=> sum+(r.qty||0),0)} Qty`;
+}
+
+/* Exports */
+exportCsv.onclick = () => downloadCSV(to2D(), `inventory_${stamp()}.csv`);
+exportXlsx.onclick = async () => {
+  const xlsx = await import("https://cdn.jsdelivr.net/npm/xlsx@0.20.2/+esm");
+  const ws = xlsx.utils.aoa_to_sheet(to2D());
+  const wb = xlsx.utils.book_new();
+  xlsx.utils.book_append_sheet(wb, ws, "Inventory");
+  const out = xlsx.write(wb, { bookType:"xlsx", type:"array" });
+  downloadBlob(new Blob([out], {type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}), `inventory_${stamp()}.xlsx`);
+};
+function to2D(){ return [["Barcode/SKU","Qty","Notes","Timestamp ISO"], ...rows.filter(r=>!r._deleted).map(r=>[r.code,r.qty,r.notes||"",r.ts])]; }
+function downloadCSV(aoa, name){
+  const csv = aoa.map(r=>r.map(v=>{ v=String(v??""); return /[",\n]/.test(v)?`"${v.replace(/"/g,'""')}"`:v; }).join(",")).join("\r\n");
+  downloadBlob(new Blob([csv],{type:"text/csv"}), name);
+}
+function downloadBlob(blob, name){ const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(url), 2000); }
+function stamp(){ const d=new Date(), p=n=>String(n).padStart(2,"0"); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`; }
+</script>
+</body>
+</html>
